@@ -4,6 +4,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 
+try:
+    import pycountry
+except Exception:
+    pycountry = None
+
 st.set_page_config(
     page_title="ZEN Approval & Revenue Dashboard",
     page_icon="💳",
@@ -17,6 +22,30 @@ REQUIRED_COLUMNS = [
 ]
 
 CHANNELS = ["Apple Pay", "Google Pay", "Card"]
+
+
+def get_country_name(country_code: str) -> str:
+    """Convert ISO-2 country code to full country name for dashboard display."""
+    if pd.isna(country_code):
+        return "Unknown"
+    code = str(country_code).strip().upper()
+    if not code or code in {"NAN", "NONE", "UNKNOWN"}:
+        return "Unknown"
+    if pycountry is not None:
+        try:
+            country = pycountry.countries.get(alpha_2=code)
+            if country:
+                return country.name
+        except Exception:
+            pass
+    fallback = {
+        "AE": "United Arab Emirates", "AU": "Australia", "BE": "Belgium", "BO": "Bolivia",
+        "BR": "Brazil", "CA": "Canada", "CL": "Chile", "DE": "Germany", "DO": "Dominican Republic",
+        "DZ": "Algeria", "EC": "Ecuador", "EG": "Egypt", "ES": "Spain", "FR": "France",
+        "GB": "United Kingdom", "HU": "Hungary", "JP": "Japan", "KE": "Kenya", "US": "United States",
+        "ZA": "South Africa",
+    }
+    return fallback.get(code, code)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -55,6 +84,10 @@ def load_data(uploaded_file=None) -> pd.DataFrame:
     df["transaction_state"] = df["transaction_state"].astype(str).str.upper().str.strip()
     df["payment_channel"] = df["payment_channel"].astype(str).str.strip()
     df["customer_country"] = df["customer_country"].fillna("Unknown").astype(str).str.upper().str.strip()
+    df["customer_country_name"] = df["customer_country"].apply(get_country_name)
+    df["country_display"] = df.apply(
+        lambda r: r["customer_country_name"] if r["customer_country_name"] != "Unknown" else "Unknown", axis=1
+    )
     df["reject_code"] = df["reject_code"].fillna("Accepted / No Reject Code").astype(str)
     df["merchant_transaction_id"] = df["merchant_transaction_id"].fillna(df["transaction_id"]).astype(str)
 
@@ -80,20 +113,39 @@ def filter_data(df: pd.DataFrame) -> pd.DataFrame:
         default=CHANNELS
     )
 
-    countries = sorted(df["customer_country"].dropna().unique())
-    selected_countries = st.sidebar.multiselect(
-        "Country",
-        options=countries,
-        default=countries
+    st.sidebar.markdown("### Country")
+    all_countries = st.sidebar.checkbox("All countries", value=True)
+
+    country_options = (
+        df[["customer_country", "country_display"]]
+        .drop_duplicates()
+        .sort_values("country_display")
     )
+    country_label_to_code = dict(
+        zip(country_options["country_display"], country_options["customer_country"])
+    )
+
+    if all_countries:
+        selected_country_codes = set(country_options["customer_country"].tolist())
+    else:
+        selected_country_labels = st.sidebar.multiselect(
+            "Select country by full name",
+            options=list(country_label_to_code.keys()),
+            default=[]
+        )
+        selected_country_codes = {country_label_to_code[label] for label in selected_country_labels}
 
     filtered = df.copy()
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_date, end_date = date_range
-        filtered = filtered[(filtered["created_date"] >= start_date) & (filtered["created_date"] <= end_date)]
+        # Important: use the GMT+6 date column. The original CSV timestamp is GMT+0.
+        filtered = filtered[
+            (filtered["created_date_gmt6"] >= start_date) &
+            (filtered["created_date_gmt6"] <= end_date)
+        ]
 
     filtered = filtered[filtered["payment_channel"].isin(selected_channels)]
-    filtered = filtered[filtered["customer_country"].isin(selected_countries)]
+    filtered = filtered[filtered["customer_country"].isin(selected_country_codes)]
     return filtered
 
 
@@ -132,7 +184,7 @@ def summarize_by_channel(df: pd.DataFrame) -> pd.DataFrame:
 def summarize_country_revenue(df: pd.DataFrame) -> pd.DataFrame:
     accepted = df[df["transaction_state"] == "ACCEPTED"].copy()
     country_revenue = accepted.pivot_table(
-        index="customer_country",
+        index="country_display",
         columns="payment_channel",
         values="authorization_amount",
         aggfunc="sum",
@@ -144,13 +196,14 @@ def summarize_country_revenue(df: pd.DataFrame) -> pd.DataFrame:
             country_revenue[channel] = 0
 
     country_revenue["Total Revenue"] = country_revenue[CHANNELS].sum(axis=1)
+    country_revenue = country_revenue.rename(columns={"country_display": "Country"})
     country_revenue = country_revenue.sort_values("Total Revenue", ascending=False)
     return country_revenue
 
 
 def summarize_country_approval(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for (country, channel), group in df.groupby(["customer_country", "payment_channel"]):
+    for (country, channel), group in df.groupby(["country_display", "payment_channel"]):
         unique_orders = group["merchant_transaction_id"].nunique()
         approved_orders = group.groupby("merchant_transaction_id")["transaction_state"].apply(lambda x: (x == "ACCEPTED").any()).sum()
         approved_revenue = group.loc[group["transaction_state"] == "ACCEPTED", "authorization_amount"].sum()
@@ -275,12 +328,13 @@ def main():
 
         top_n = st.slider("Top countries to show", 5, 30, 15)
         chart_df = country_revenue.head(top_n).melt(
-            id_vars="customer_country",
+            id_vars="country_display",
             value_vars=CHANNELS,
             var_name="Payment Channel",
             value_name="Approved Revenue"
         )
-        fig = px.bar(chart_df, x="customer_country", y="Approved Revenue", color="Payment Channel", barmode="group", title=f"Top {top_n} Countries by Approved Revenue")
+        fig = px.bar(chart_df, x="country_display", y="Approved Revenue", color="Payment Channel", barmode="group", title=f"Top {top_n} Countries by Approved Revenue")
+        fig.update_layout(xaxis_title="Country")
         st.plotly_chart(fig, use_container_width=True)
 
     with tab3:
@@ -318,8 +372,10 @@ def main():
 
     with tab5:
         st.subheader("Filtered Raw Data")
-        st.dataframe(filtered, use_container_width=True)
-        csv = filtered.to_csv(index=False).encode("utf-8")
+        raw_display = filtered.copy()
+        raw_display = raw_display.rename(columns={"country_display": "Country", "created_date_gmt6": "created_date"})
+        st.dataframe(raw_display, use_container_width=True)
+        csv = raw_display.to_csv(index=False).encode("utf-8")
         st.download_button("Download Filtered Data", data=csv, file_name="zen_filtered_data.csv", mime="text/csv")
 
 
